@@ -1,0 +1,960 @@
+原创AXIN 独家反作弊  If you don't understand, you can use translation
+——更新:FOX权限给予管理←删除要不然无法执行 指令↓
+/setPermission <用户名> <权限等级>
+local AntiCheatSystem = require(game.ServerScriptService:WaitForChild("AntiCheatSystem"))
+AntiCheatSystem.Start()
+local Policy = {}
+Policy.Revision = 1
+
+Policy.RateLimits = {
+    Fire   = { perSecond = 9,  burst = 12 },
+    Stab   = { perSecond = 4,  burst = 6  },
+    Buy    = { perSecond = 2,  burst = 2  },
+    Drop   = { perSecond = 3,  burst = 4  },
+    Ping   = { perSecond = 3,  burst = 3  },
+}
+
+Policy.Movement = {
+    MaxSpeed      = 30,    -- 含冲刺/药效上限（m/s）
+    MaxAccel      = 140,   -- m/s^2
+    MaxFrameShift = 35,    -- 单帧位移阈值（瞬移）
+    MaxAltitude   = 80,    -- 离地高度（无飞行许可）
+    GroundProbe   = 220,   -- 探测射线长度
+}
+
+-- 武器数据（服务端权威重算伤害/后坐力/射速）
+Policy.Weapons = {
+    ["G17"] = { type="gun", dpsCap=180, bulletSpeed=500, rpm=600, pellet=1, baseDamage=22, headMul=2.0, bodyMul=1.0, limbMul=0.65, maxRange=200, spread=1.6, serverRecoil=2.1 },
+    ["M1911"]={ type="gun", dpsCap=200, bulletSpeed=520, rpm=520, pellet=1, baseDamage=26, headMul=2.0, bodyMul=1.0, limbMul=0.7,  maxRange=190, spread=1.8, serverRecoil=2.3 },
+    ["Knife"]={ type="melee", dpsCap=110, swingRate=1.6, baseDamage=35, backstabMul=1.5, range=6.5 },
+}
+
+Policy.InventoryWhitelist = {
+    Tools = { "G17", "M1911", "Knife", "Bandage", "Medkit", "Ammo9mm"，"AKUN"},
+}
+
+-- 经济上限（防刷钱/洗钱）
+Policy.Economy = {
+    EarnPerMin   = 999999999,
+    TradeCapMin  = 99999999,
+    DropCapMin   = 99999999,
+    StackLimit   = 99999999,
+}
+
+-- 计分与动作阈值
+Policy.Scores = {
+    TP=6, Speed=4, Accel=2, Fly=5,
+    BadPayload=3, BadSig=5, Rate=2, BadItem=3, BadWeapon=4,
+    DpsCap=5, RangeHack=4, ROF=4, Spoof=3
+}
+Policy.Actions = { warn=4, restrict=8, kick=12, ban=20 }
+
+return Policy
+local AdminByName = {}
+local Players = game:GetService("Players")
+
+local Combat = {}
+Combat.__index = Combat
+
+-- 保留近几百毫秒玩家胶囊的历史位置，做 Lag Compensation
+local history = {} -- [player] = { {t, pos, look}, ... }
+local MAX_BACKTRACK = 0.25  -- 秒
+
+local function recordHistory(plr)
+    plr.CharacterAdded:Connect(function(char)
+        local hrp = char:WaitForChild("HumanoidRootPart",5)
+        if not hrp then return end
+        history[plr] = {}
+        game:GetService("RunService").Heartbeat:Connect(function()
+            local arr = history[plr]; if not arr then return end
+            table.insert(arr, {t=time(), pos=hrp.Position, look=hrp.CFrame.LookVector})
+            -- 修剪
+            local cutoff = time() - MAX_BACKTRACK
+            while #arr > 0 and arr[1].t < cutoff do table.remove(arr,1) end
+        end)
+    end)
+    plr.CharacterRemoving:Connect(function() history[plr]=nil end)
+end
+
+local function backtrackPosition(target, shotTime)
+    local arr = history[target]; if not arr or #arr==0 then return nil end
+    -- 线性插值找到 shotTime 附近位置
+    local prev, nextp
+    for i=1,#arr-1 do
+        if arr[i].t <= shotTime and arr[i+1].t >= shotTime then prev, nextp = arr[i], arr[i+1]; break end
+    end
+    if not prev then return arr[#arr].pos end
+    local alpha = (shotTime - prev.t)/math.max(1e-6, nextp.t - prev.t)
+    return prev.pos:Lerp(nextp.pos, math.clamp(alpha,0,1))
+end
+
+-- 简化的命中验证：子弹线段与“目标胶囊”距离阈值
+local function capsuleHit(shooterPos, dir, range, targetPos)
+    local bulletEnd = shooterPos + dir.Unit * range
+    local seg = (bulletEnd - shooterPos)
+    local t = math.clamp((targetPos - shooterPos):Dot(seg)/math.max(1e-6, seg:Dot(seg)),0,1)
+    local closest = shooterPos + seg * t
+    local dist = (closest - targetPos).Magnitude
+    return dist < 4.0  -- 胶囊半径近似
+end
+
+function Combat.Init(policy, onFlag)
+    Combat._policy = policy
+    Combat._onFlag = onFlag
+    Players.PlayerAdded:Connect(recordHistory)
+end
+
+-- 处理枪械开火意图（Remote 已过 NetShield）
+-- payload: { weapon="G17", dir=Vector3, t=number(sig时间), target = number(UserId?) 可选 }
+function Combat.ProcessFire(plr, payload)
+    local w = Combat._policy.Weapons[payload.weapon]
+    if not w or w.type~="gun" then
+        return Combat._onFlag(plr, "BadWeapon", "Combat", {weapon = payload.weapon})
+    end
+    -- 服务器权威重算：射速/DPS/距离
+    -- 你可以为每位玩家维护一个武器冷却表，这里省略存储，演示关键校验：
+    -- 示例：验证方向单位向量
+    if payload.dir.Magnitude < 0.5 or payload.dir.Magnitude > 1.5 then
+        return Combat._onFlag(plr,"BadPayload","Combat",{why="dir"})
+    end
+
+    -- L-C：根据客户端时间戳回溯目标位置（或至少回溯射手自身位置）
+    local shotTime = math.clamp(payload.t or time(), time()-0.5, time())
+    -- 命中验证（可选：如果带 targetId，更严格核验）
+    if payload.targetUserId then
+        local targetPlr = game.Players:GetPlayerByUserId(payload.targetUserId)
+        if targetPlr and targetPlr.Character then
+            local tgtPos = backtrackPosition(targetPlr, shotTime) or targetPlr.Character:FindFirstChild("HumanoidRootPart").Position
+            -- 距离/射程校验
+            local shooterPos = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") and plr.Character.HumanoidRootPart.Position
+            if not shooterPos then return end
+            local range = w.maxRange
+            if not capsuleHit(shooterPos, payload.dir, range, tgtPos) then
+                return Combat._onFlag(plr,"RangeHack","Combat",{w=payload.weapon})
+            end
+        end
+    end
+
+    -- 伤害重算（服务器查表，不信客户端）
+    -- 示例：你可在这里做部位判定（服务器用射线/RaycastWhitelist）
+    -- 这里用简化：命中则按 bodyMul，暴击由服务器另算
+    local base = w.baseDamage
+    local dmg = base * w.bodyMul
+    -- DPS 上限防连点/改速
+    --（真实实现应追踪每秒累计伤害与射速，这里演示触发点）
+    -- Combat._onFlag(plr, "DpsCap", "Combat", {...}) -- 你在集成时加上累计器
+
+    -- 真正施加伤害（服务端）
+    -- 例：找到 Humanoid 并减血（略）
+end
+
+-- 近战
+-- payload: { weapon="Knife", aim=Vector3, t=number }
+function Combat.ProcessMelee(plr, payload)
+    local w = Combat._policy.Weapons[payload.weapon]
+    if not w or w.type~="melee" then
+        return Combat._onFlag(plr, "BadWeapon", "Combat", {weapon = payload.weapon})
+    end
+    -- 服务器用射线/区域检测目标是否在 w.range 内；客户端只报“意图”
+    -- 命中后服务器重算是否背刺、伤害倍率等
+end
+
+return Combat
+-- AntiMoveGuard.module.lua
+-- 原创移动速度 + 范围检测反作弊
+-- 支持分级处罚：严重 43 天，轻度 15 天
+-- 支持用户名解封
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local AntiMoveGuard = {}
+
+-- 参数配置
+local Config = {
+    MaxSpeed = 30,         -- 允许最大速度（m/s）
+    MaxTeleportDist = 50,  -- 单帧允许的最大位移（m）
+    SevereBanDays = 43,    -- 严重处罚天数
+    MinorBanDays = 15,     -- 轻度处罚天数
+}
+
+-- 封禁数据（简单内存表，实际应放 DataStore）
+local Bans = {}  -- [UserId] = { expire = 时间戳, reason = "string" }
+
+-- 封禁函数
+local function banPlayer(plr, days, reason)
+    local expire = os.time() + (days * 24 * 60 * 60)
+    Bans[plr.UserId] = { expire = expire, reason = reason }
+    plr:Kick("[AntiCheat] 你已被封禁 "..days.." 天\n原因: "..reason.."\n如需申诉请联系管理员")
+end
+
+-- 检查是否已封禁
+function AntiMoveGuard.IsBanned(plr)
+    local ban = Bans[plr.UserId]
+    if ban and os.time() < ban.expire then
+        return true, ban
+    end
+    return false
+end
+
+-- 解封
+function AntiMoveGuard.UnbanByName(name)
+    for userId, info in pairs(Bans) do
+        local plr = Players:GetPlayerByUserId(userId)
+        if plr and plr.Name == name then
+            Bans[userId] = nil
+            return true
+        end
+    end
+    -- 如果玩家不在线，可以根据 DataStore 查询用户名→UserId 来实现
+    for userId, info in pairs(Bans) do
+        local success, plrName = pcall(function()
+            return Players:GetNameFromUserIdAsync(userId)
+        end)
+        if success and plrName == name then
+            Bans[userId] = nil
+            return true
+        end
+    end
+    return false
+end
+
+-- 核心检测逻辑
+function AntiMoveGuard.Start()
+    Players.PlayerAdded:Connect(function(plr)
+        local banned, info = AntiMoveGuard.IsBanned(plr)
+        if banned then
+            plr:Kick("[AntiCheat] 你仍处于封禁中\n原因: "..info.reason.."\n到期: "..os.date("%Y-%m-%d %H:%M:%S", info.expire))
+            return
+        end
+
+        plr.CharacterAdded:Connect(function(char)
+            local hrp = char:WaitForChild("HumanoidRootPart", 5)
+            if not hrp then return end
+
+            local lastPos = hrp.Position
+            local lastT = os.clock()
+
+            RunService.Heartbeat:Connect(function()
+                if not hrp.Parent then return end
+                local now = os.clock()
+                local dt = now - lastT
+                if dt <= 0 then return end
+
+                local pos = hrp.Position
+                local dist = (pos - lastPos).Magnitude
+                local speed = dist / dt
+
+                if speed > Config.MaxSpeed * 1.5 then
+                    banPlayer(plr, Config.SevereBanDays, "移动速度异常")
+                elseif dist > Config.MaxTeleportDist then
+                    banPlayer(plr, Config.MinorBanDays, "瞬移/范围异常")
+                end
+
+                lastPos, lastT = pos, now
+            end)
+        end)
+    end)
+end
+
+return AntiMoveGuard-- ServerScriptService/UnbanCommands.server.lua
+-- 管理员聊天输入 "!unban 用户名" 即可解封
+
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService") -- 新聊天系统
+local BanService = require(script.Parent:WaitForChild("BanService"))
+local AdminCheck = require(script.Parent:WaitForChild("AdminCheck"))
+
+-- 进入游戏时自动检查封禁
+Players.PlayerAdded:Connect(function(plr)
+	task.defer(function()
+		local banned, data = BanService.IsBanned(plr.UserId)
+		if banned then
+			local untilStr = os.date("%Y-%m-%d %H:%M:%S", data.expire)
+			plr:Kick(("[AntiCheat] 你被封禁至 %s\n原因: %s"):format(untilStr, tostring(data.reason or "violation")))
+		end
+	end)
+end)
+
+-- 统一处理解封逻辑
+local function handleUnbanRequest(requester, nameArg)
+	if not AdminCheck.IsAdmin(requester) then
+		return false, "no_permission"
+	end
+	if not nameArg or nameArg == "" then
+		return false, "usage: !unban 用户名"
+	end
+	local ok, err = BanService.UnbanByUsername(nameArg)
+	if not ok then
+		return false, "unban_failed: " .. tostring(err)
+	end
+	return true
+end
+
+-- ① 新聊天系统（推荐）
+if TextChatService and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+	local function onCmd(fromSpeaker: Player, text: string)
+		if text:sub(1, 7):lower() == "!unban " then
+			local targetName = text:sub(8):gsub("^%s+", ""):gsub("%s+$", "")
+			local ok, err = handleUnbanRequest(fromSpeaker, targetName)
+			if ok then
+				TextChatService:DisplaySystemMessage(("✅ 已解封：%s（操作人：%s）"):format(targetName, fromSpeaker.Name))
+			else
+				TextChatService:DisplaySystemMessage(("⛔ 无法解封：%s"):format(err))
+			end
+		end
+	end
+
+	-- 监听所有玩家的消息
+	Players.PlayerAdded:Connect(function(plr)
+		plr.Chatted:Connect(function(_) end) -- 兼容旧 API（不使用）
+	end)
+
+	-- 使用 TextChatService hook：
+	if TextChatService.OnIncomingMessage then
+		TextChatService.OnIncomingMessage = function(msg: TextChatMessage)
+			local speaker = msg.TextSource and Players:GetPlayerByUserId(msg.TextSource.UserId)
+			if speaker then onCmd(speaker, msg.Text) end
+			return msg
+		end
+	end
+else
+	-- ② 旧聊天系统（备用）
+	Players.PlayerAdded:Connect(function(plr)
+		plr.Chatted:Connect(function(message)
+			if message:sub(1, 7):lower() == "!unban " then
+				local targetName = message:sub(8):gsub("^%s+", ""):gsub("%s+$", "")
+				local ok, err = handleUnbanRequest(plr, targetName)
+				if ok then
+					plr:LoadCharacter()
+					print(("已解封：%s（操作人：%s）"):format(targetName, plr.Name))
+				else
+					warn(("无法解封：%s"):format(err))
+				end
+			end
+		end)
+	end)
+endlocal Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local BanStore = DataStoreService:GetDataStore("BanStore_v3")  -- 使用版本管理
+local AntiSilentAim = {}
+
+-- 存储封禁记录
+local function getBanKey(userId)
+    return "ban:" .. tostring(userId)
+end
+
+-- 玩家封禁操作
+function AntiSilentAim.BanPlayer(player, reason)
+    local userId = player.UserId
+    local expirationTime = os.time() + (120 * 24 * 60 * 60)  -- 封禁120天
+
+    -- 存储封禁信息到 DataStore
+    local success, err = pcall(function()
+        BanStore:SetAsync(getBanKey(userId), {expire = expirationTime, reason = reason})
+    end)
+
+    if not success then
+        warn("无法记录封禁信息: " .. err)
+    end
+
+    -- 封禁玩家
+    player:Kick(("[AntiSilentAim] 你因使用静默瞄准被封禁，封禁时间：120天\n原因：%s"):format(reason))
+end
+
+-- 检查玩家是否封禁
+function AntiSilentAim.CheckBanStatus(player)
+    local userId = player.UserId
+    local banData = BanStore:GetAsync(getBanKey(userId))
+
+    if banData then
+        if banData.expire > os.time() then
+            -- 如果封禁时间还未到期，踢出玩家
+            player:Kick(("[AntiSilentAim] 你被封禁至: %s\n原因: %s"):format(os.date("%Y-%m-%d %H:%M:%S", banData.expire), banData.reason))
+            return true
+        else
+            -- 封禁时间到期，自动解封
+            pcall(function()
+                BanStore:RemoveAsync(getBanKey(userId))
+            end)
+        end
+    end
+    return false
+end
+
+-- 计算玩家瞄准角度差异
+function AntiSilentAim.CalculateAimingDifference(player)
+    local char = player.Character
+    if not char then return 0 end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char:FindFirstChild("Humanoid")
+    if not hrp or not humanoid then return 0 end
+
+    -- 获取玩家当前视角（瞄准方向）
+    local camera = game.Workspace.CurrentCamera
+    local viewDirection = (camera.CFrame.LookVector).unit
+
+    -- 获取玩家的身体方向
+    local bodyDirection = hrp.CFrame.LookVector.unit
+
+    -- 计算两个方向之间的角度差异
+    local angleDiff = math.acos(viewDirection:Dot(bodyDirection))
+    return angleDiff
+end
+
+-- 检查射击目标是否正常
+function AntiSilentAim.ValidateShot(player, shotPosition)
+    local char = player.Character
+    if not char then return false end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    -- 计算从玩家位置到射击位置的距离
+    local distance = (hrp.Position - shotPosition).Magnitude
+
+    -- 检查是否为超远距离射击（忽略实际范围限制）
+    if distance > 500 then
+        return true  -- 可能为静默瞄准
+    end
+
+    -- 进一步检查射击的准确性：射击位置与敌人身体部位相距太小
+    local targetPart = workspace:FindPartOnRay(Ray.new(hrp.Position, shotPosition - hrp.Position))
+    if targetPart and targetPart.Parent then
+        local targetPlayer = Players:GetPlayerFromCharacter(targetPart.Parent)
+        if targetPlayer then
+            -- 如果击中目标且位置过于精确，认为是作弊
+            return true
+        end
+    end
+
+    return false
+end
+
+-- 监控玩家行为
+function AntiSilentAim.MonitorPlayer(player)
+    -- 监控瞄准角度与射击准确性
+    local lastCheckTime = os.clock()
+    local checkInterval = 0.7  -- 每0.7秒检查一次
+
+    RunService.Heartbeat:Connect(function()
+        if os.clock() - lastCheckTime >= checkInterval then
+            lastCheckTime = os.clock()
+
+            -- 检查是否存在封禁状态
+            if AntiSilentAim.CheckBanStatus(player) then
+                return
+            end
+
+            -- 计算瞄准角度差异
+            local angleDiff = AntiSilentAim.CalculateAimingDifference(player)
+
+            -- 如果瞄准角度过小，且检测到其他不正常行为，认定为静默瞄准
+            if angleDiff < 0.1 then  -- 0.1 弧度为判断标准，可能需要根据具体情况调整
+                local shotPosition = player:GetMouse().Hit.p  -- 获取射击位置（简化版）
+                if AntiSilentAim.ValidateShot(player, shotPosition) then
+                    -- 检测到静默瞄准，立即封禁玩家
+                    AntiSilentAim.BanPlayer(player, "SilentAimCheat")
+                end
+            end
+        end
+    end)
+end
+
+-- 开始防作弊检查
+function AntiSilentAim.Start()
+    Players.PlayerAdded:Connect(function(player)
+        -- 先检查玩家是否被封禁
+        if AntiSilentAim.CheckBanStatus(player) then
+            return
+        end
+
+        -- 启动玩家监控
+        AntiSilentAim.MonitorPlayer(player)
+    end)
+end
+
+return AntiSilentAim
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local DataStoreService = game:GetService("DataStoreService")
+
+-- 动态变化的反作弊校验
+local AntiCheatGuard = {}
+
+-- 存储作弊记录（简化版，实际使用时应该存到 DataStore）
+local cheatRecords = {}
+
+-- 校验玩家位置和速度的阈值
+local MAX_SPEED = 50  -- 最大速度，单位：Studs/秒
+local MAX_DISTANCE = 100  -- 最大位移，单位：Studs（每帧）
+
+-- 玩家速度和位移校验
+function AntiCheatGuard.ValidatePlayerMovement(plr, position, lastPosition, lastTime)
+    local deltaTime = lastTime and (os.clock() - lastTime) or 0
+    if deltaTime <= 0 then return end
+    local distance = (position - lastPosition).Magnitude
+    local speed = distance / deltaTime
+
+    -- 判断速度是否异常
+    if speed > MAX_SPEED then
+        warn("玩家速度异常: " .. plr.Name)
+        return true, "SpeedCheat"
+    end
+
+    -- 判断位移是否异常
+    if distance > MAX_DISTANCE then
+        warn("玩家位移异常: " .. plr.Name)
+        return true, "TeleportCheat"
+    end
+
+    return false
+end
+
+-- 玩家信息校验：防止客户端修改
+function AntiCheatGuard.ValidateClientData(plr)
+    local playerData = plr:FindFirstChild("PlayerData")  -- 假设有存储玩家数据
+
+    -- 检查是否存在玩家数据，并且数据没有被篡改
+    if not playerData then
+        warn("没有找到玩家数据: " .. plr.Name)
+        return true, "NoPlayerData"
+    end
+
+    -- 你可以扩展验证方式，比如对比玩家数据的正确性
+    if playerData.SomeValue < 0 then
+        warn("玩家数据不正常: " .. plr.Name)
+        return true, "DataCheat"
+    end
+
+    return false
+end
+
+-- 定时检查：防止长时间停留在某个位置
+function AntiCheatGuard.CheckForSuspiciousActivity(plr)
+    -- 每15秒钟检查一次
+    local lastCheckTime = 0
+    local checkInterval = 15  -- 15秒
+
+    -- 定时检测
+    RunService.Heartbeat:Connect(function()
+        if os.clock() - lastCheckTime >= checkInterval then
+            lastCheckTime = os.clock()
+
+            -- 获取玩家当前的位置
+            local char = plr.Character
+            if char then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local currentPos = hrp.Position
+                    local lastPos = plr:FindFirstChild("LastPosition")
+
+                    if lastPos then
+                        local moved, reason = AntiCheatGuard.ValidatePlayerMovement(plr, currentPos, lastPos.Value, lastCheckTime)
+                        if moved then
+                            -- 记录作弊行为
+                            cheatRecords[plr.UserId] = {reason = reason, timestamp = os.time()}
+                            plr:Kick("[AntiCheat] 被踢出：检测到异常行为 " .. reason)
+                        end
+                    end
+                    -- 更新玩家位置
+                    if not plr:FindFirstChild("LastPosition") then
+                        local lastPosition = Instance.new("Vector3Value")
+                        lastPosition.Name = "LastPosition"
+                        lastPosition.Parent = plr
+                    end
+                    plr.LastPosition.Value = currentPos
+                end
+            end
+        end
+    end)
+end
+
+-- 防止远程事件被滥用（防止作弊的脚本利用）
+function AntiCheatGuard.RestrictRemoteCalls()
+    -- 限制远程事件调用频率，避免快速调用（DoS攻击）
+    local remoteCalls = {}
+    local cooldown = 0.2  -- 0.2秒冷却时间
+
+    -- 假设你有一个远程事件用于接收玩家的行为
+    local remoteEvent = game.ReplicatedStorage:WaitForChild("SomeRemoteEvent")
+
+    remoteEvent.OnServerEvent:Connect(function(plr, action)
+        local currentTime = os.clock()
+        if remoteCalls[plr.UserId] and currentTime - remoteCalls[plr.UserId] < cooldown then
+            warn("远程事件调用过于频繁: " .. plr.Name)
+            plr:Kick("[AntiCheat] 被踢出：远程事件调用频繁")
+        else
+            remoteCalls[plr.UserId] = currentTime
+            -- 继续处理合法请求
+        end
+    end)
+end
+
+-- 主逻辑：初始化玩家检查
+function AntiCheatGuard.Start()
+    Players.PlayerAdded:Connect(function(plr)
+        -- 防止篡改：检查客户端数据
+        local cheated, reason = AntiCheatGuard.ValidateClientData(plr)
+        if cheated then
+            cheatRecords[plr.UserId] = {reason = reason, timestamp = os.time()}
+            plr:Kick("[AntiCheat] 被踢出：检测到客户端篡改行为")
+            return
+        end
+
+        -- 检查玩家行为：避免卡在同一位置
+        AntiCheatGuard.CheckForSuspiciousActivity(plr)
+        -- 限制远程事件调用
+        AntiCheatGuard.RestrictRemoteCalls()
+    end)
+end
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local BanStore = DataStoreService:GetDataStore("BanStore_v4")  -- 使用版本管理
+
+local MarkCheaterSystem = {}
+
+-- 存储封禁记录
+local function getBanKey(userId)
+    return "ban:" .. tostring(userId)
+end
+
+-- 玩家封禁操作
+function MarkCheaterSystem.BanPlayer(player, reason)
+    local userId = player.UserId
+    local expirationTime = os.time() + (43 * 24 * 60 * 60)  -- 封禁43天
+
+    -- 存储封禁信息到 DataStore
+    local success, err = pcall(function()
+        BanStore:SetAsync(getBanKey(userId), {expire = expirationTime, reason = reason})
+    end)
+
+    if not success then
+        warn("无法记录封禁信息: " .. err)
+    end
+
+    -- 封禁玩家
+    player:Kick(("[AntiCheat] 你因使用作弊被封禁，封禁时间：43天\n原因：%s"):format(reason))
+end
+
+-- 检查玩家是否封禁
+function MarkCheaterSystem.CheckBanStatus(player)
+    local userId = player.UserId
+    local banData = BanStore:GetAsync(getBanKey(userId))
+
+    if banData then
+        if banData.expire > os.time() then
+            -- 如果封禁时间还未到期，踢出玩家
+            player:Kick(("[AntiCheat] 你被封禁至: %s\n原因: %s"):format(os.date("%Y-%m-%d %H:%M:%S", banData.expire), banData.reason))
+            return true
+        else
+            -- 封禁时间到期，自动解封
+            pcall(function()
+                BanStore:RemoveAsync(getBanKey(userId))
+            end)
+        end
+    end
+    return false
+end
+
+-- 标记作弊者并启动处罚机制
+function MarkCheaterSystem.MarkAndPunish(player, cheatType)
+    local userId = player.UserId
+
+    -- 标记作弊类型并等待12秒
+    local markTime = os.time()
+    local markInfo = {cheatType = cheatType, time = markTime}
+
+    -- 记录标记信息
+    local success, err = pcall(function()
+        BanStore:SetAsync("mark:" .. tostring(userId), markInfo)
+    end)
+
+    if not success then
+        warn("无法记录标记信息: " .. err)
+    end
+
+    -- 等待12秒后启动处罚机制
+    delay(12, function()
+        -- 检查玩家是否已经被标记并且没有解封
+        local currentMark = BanStore:GetAsync("mark:" .. tostring(userId))
+
+        if currentMark and currentMark.time == markTime then
+            -- 12秒内触发处罚机制
+            MarkCheaterSystem.BanPlayer(player, cheatType)
+        end
+    end)
+end
+
+-- 处理玩家加入事件
+function MarkCheaterSystem.Start()
+    Players.PlayerAdded:Connect(function(player)
+        -- 先检查玩家是否被封禁
+        if MarkCheaterSystem.CheckBanStatus(player) then
+            return
+        end
+
+        -- 在游戏中给管理员提供标记功能
+        -- 举个例子：管理员可以通过聊天命令标记作弊玩家
+        local function markCheatCommand(message)
+            local parts = message:split(" ")
+            if parts[1] == "!markcheat" and parts[2] and parts[3] then
+                local targetPlayerName = parts[2]
+                local cheatType = parts[3]
+
+                local targetPlayer = Players:FindFirstChild(targetPlayerName)
+                if targetPlayer then
+                    -- 只有管理员能够执行此操作
+                    if player.UserId == 123456789 then  -- 这里填入管理员的 UserId
+                        -- 标记作弊并触发处罚机制
+                        MarkCheaterSystem.MarkAndPunish(targetPlayer, cheatType)
+                    end
+                end
+            end
+        end
+
+        player.Chatted:Connect(markCheatCommand)
+    end)
+end
+
+return MarkCheaterSystem
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local BanStore = DataStoreService:GetDataStore("BanStore_v5")  -- 使用版本管理
+
+local BulletThroughWallDetector = {}
+
+-- 存储封禁记录
+local function getBanKey(userId)
+    return "ban:" .. tostring(userId)
+end
+
+-- 玩家封禁操作
+function BulletThroughWallDetector.BanPlayer(player, reason)
+    local userId = player.UserId
+    local expirationTime = os.time() + (12 * 24 * 60 * 60)  -- 封禁12天
+
+    -- 存储封禁信息到 DataStore
+    local success, err = pcall(function()
+        BanStore:SetAsync(getBanKey(userId), {expire = expirationTime, reason = reason})
+    end)
+
+    if not success then
+        warn("无法记录封禁信息: " .. err)
+    end
+
+    -- 封禁玩家
+    player:Kick(("[AntiCheat] 你因使用穿墙作弊被封禁，封禁时间：12天\n原因：%s"):format(reason))
+end
+
+-- 检查玩家是否封禁
+function BulletThroughWallDetector.CheckBanStatus(player)
+    local userId = player.UserId
+    local banData = BanStore:GetAsync(getBanKey(userId))
+
+    if banData then
+        if banData.expire > os.time() then
+            -- 如果封禁时间还未到期，踢出玩家
+            player:Kick(("[AntiCheat] 你被封禁至: %s\n原因: %s"):format(os.date("%Y-%m-%d %H:%M:%S", banData.expire), banData.reason))
+            return true
+        else
+            -- 封禁时间到期，自动解封
+            pcall(function()
+                BanStore:RemoveAsync(getBanKey(userId))
+            end)
+        end
+    end
+    return false
+end
+
+-- 检测射击是否穿透墙壁
+function BulletThroughWallDetector.DetectBulletThroughWall(player, shotPosition, targetPosition)
+    local char = player.Character
+    if not char then return false end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    -- 创建一条从玩家射击位置到目标位置的射线
+    local ray = Ray.new(shotPosition, (targetPosition - shotPosition).unit * 500)
+
+    -- 检查射线与世界中的物体是否相交
+    local hitPart, hitPosition = Workspace:FindPartOnRay(ray, player.Character, false, true)
+
+    -- 如果射线击中了物体，并且这个物体不是玩家的目标，说明可能是穿墙
+    if hitPart and hitPart.Parent and hitPart.Parent ~= char and hitPart.CanCollide then
+        -- 玩家射击穿透了墙壁或其他障碍物
+        return true
+    end
+
+    return false
+end
+
+-- 监控玩家射击行为
+function BulletThroughWallDetector.MonitorPlayer(player)
+    local lastShotTime = 0
+    local checkInterval = 0.2  -- 每0.2秒检查一次玩家的射击行为
+
+    RunService.Heartbeat:Connect(function()
+        if os.clock() - lastShotTime >= checkInterval then
+            lastShotTime = os.clock()
+
+            -- 检查玩家是否被封禁
+            if BulletThroughWallDetector.CheckBanStatus(player) then
+                return
+            end
+
+            -- 玩家射击的逻辑
+            local char = player.Character
+            if not char then return end
+
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+
+            -- 假设玩家射击的位置是通过玩家的 `Mouse` 对象来获得的
+            local mouse = player:GetMouse()
+            local shotPosition = hrp.Position
+            local targetPosition = mouse.Hit.p
+
+            -- 检查是否存在穿墙行为
+            if BulletThroughWallDetector.DetectBulletThroughWall(player, shotPosition, targetPosition) then
+                -- 检测到穿墙行为，立刻处罚
+                BulletThroughWallDetector.BanPlayer(player, "BulletThroughWallCheat")
+            end
+        end
+    end)
+end
+
+-- 处理玩家加入事件
+function BulletThroughWallDetector.Start()
+    Players.PlayerAdded:Connect(function(player)
+        -- 先检查玩家是否被封禁
+        if BulletThroughWallDetector.CheckBanStatus(player) then
+            return
+        end
+
+        -- 监控玩家射击行为
+        BulletThroughWallDetector.MonitorPlayer(player)
+    end)
+end
+
+return BulletThroughWallDetector
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Notification = ReplicatedStorage:WaitForChild("Notification")
+local AdminAccessGranted = ReplicatedStorage:WaitForChild("AdminAccessGranted")
+local AdminAccessDenied = ReplicatedStorage:WaitForChild("AdminAccessDenied")
+
+-- 监听服务器端发来的权限通知
+Notification.OnClientEvent:Connect(function(message)
+    -- 显示通知给玩家
+    print("通知: " .. message)
+    -- 这里可以创建一个 GUI 或者直接在屏幕上显示消息
+end)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local AdminStore = DataStoreService:GetDataStore("AdminPermissions_v1")  -- 存储管理员权限数据
+
+local foxUsername = "[🛠️]"  -- 只有该用户名的玩家才能设置管理权限
+
+-- 存储权限记录
+local function getPermissionKey(userId)
+    return "permissions:" .. tostring(userId)
+end
+
+-- 设置玩家权限
+local function setPlayerPermission(player, permissionLevel)
+    local userId = player.UserId
+    local success, err = pcall(function()
+        AdminStore:SetAsync(getPermissionKey(userId), permissionLevel)
+    end)
+
+    if success then
+        return true
+    else
+        warn("设置权限失败: " .. err)
+        return false
+    end
+end
+
+-- 获取玩家权限
+local function getPlayerPermission(player)
+    local userId = player.UserId
+    local permissionLevel, err = pcall(function()
+        return AdminStore:GetAsync(getPermissionKey(userId))
+    end)
+
+    if permissionLevel then
+        return permissionLevel
+    else
+        warn("获取权限失败: " .. err)
+        return nil
+    end
+end
+
+-- 监听聊天输入指令
+Players.PlayerAdded:Connect(function(player)
+    player.Chatted:Connect(function(message)
+        -- 只有 "[🛠️]" 能使用该指令
+        if player.Name == foxUsername then
+            local args = string.split(message, " ")
+            if args[1] == "/setPermission" and #args == 3 then
+                local targetName = args[2]
+                local permissionLevel = args[3]:lower()
+
+                -- 获取目标玩家
+                local targetPlayer = Players:FindFirstChild(targetName)
+                if targetPlayer then
+                    -- 设置目标玩家权限
+                    if setPlayerPermission(targetPlayer, permissionLevel) then
+                        -- 成功后，向所有人广播
+                        ReplicatedStorage.BroadcastMessage:FireAllClients(targetPlayer.Name .. " 的权限已被设置为: " .. permissionLevel)
+                        -- 给目标玩家发送通知
+                        game.ReplicatedStorage.Notification:FireClient(targetPlayer, "你的权限已被设置为: " .. permissionLevel)
+                    else
+                        -- 如果设置失败，通知管理员
+                        player:Kick("设置权限失败!")
+                    end
+                else
+                    player:Kick("找不到玩家 " .. targetName)
+                end
+            end
+        end
+    end)
+end)
+
+-- 处理玩家的权限逻辑（这里是用作判断是否可以执行管理员权限）
+game.ReplicatedStorage.CheckPlayerPermission.OnServerEvent:Connect(function(player)
+    local permissionLevel = getPlayerPermission(player)
+    if permissionLevel then
+        if permissionLevel == "high" then
+            -- 允许高权限玩家使用管理员指令
+            game.ReplicatedStorage.AdminAccessGranted:FireClient(player)
+        else
+            -- 不允许低权限玩家使用管理员指令
+            game.ReplicatedStorage.AdminAccessDenied:FireClient(player)
+        end
+    else
+        -- 玩家没有权限
+        game.ReplicatedStorage.AdminAccessDenied:FireClient(player)
+    end
+end)
+-- 监听是否被授予管理员权限
+AdminAccessGranted.OnClientEvent:Connect(function()
+    print("你已获得管理员权限！")
+    -- 可以显示某些管理员界面或特殊功能
+end)
+
+-- 监听是否拒绝管理员权限
+AdminAccessDenied.OnClientEvent:Connect(function()
+    print("你没有管理员权限！")
+    -- 可以禁用某些管理员功能
+end)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Notification = ReplicatedStorage:WaitForChild("Notification")
+local AdminAccessGranted = ReplicatedStorage:WaitForChild("AdminAccessGranted")
+local AdminAccessDenied = ReplicatedStorage:WaitForChild("AdminAccessDenied")
