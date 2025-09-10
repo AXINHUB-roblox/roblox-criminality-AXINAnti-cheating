@@ -1,4 +1,4 @@
-原创AXIN 独家反作弊  If you don't understand, you can use translation
+原创AXIN 独家反作弊 
 ——更新:FOX权限给予管理←删除要不然无法执行 指令↓
 /setPermission <用户名> <权限等级>
 local AntiCheatSystem = require(game.ServerScriptService:WaitForChild("AntiCheatSystem"))
@@ -958,3 +958,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Notification = ReplicatedStorage:WaitForChild("Notification")
 local AdminAccessGranted = ReplicatedStorage:WaitForChild("AdminAccessGranted")
 local AdminAccessDenied = ReplicatedStorage:WaitForChild("AdminAccessDenied")
+
+-- 监听服务器端发来的权限通知
+Notification.OnClientEvent:Con
